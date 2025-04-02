@@ -19,7 +19,7 @@ $(SO): $(SRC) redismodule.h
 
 # Clean up build artifacts
 clean:
-	rm -f $(SO)
+	rm -f $(SO) dump.rdb
 
 # Install module to a system-wide directory (Optional)
 install: $(SO)
