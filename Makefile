@@ -8,12 +8,14 @@ MODULE_NAME = promoter
 SRC = $(MODULE_NAME).c
 SO = $(MODULE_NAME).so
 
+LIBS = -luuid
+
 # Default rule: Compile the shared library
 all: $(SO)
 
 # Compile the Redis module
 $(SO): $(SRC) redismodule.h
-	$(CC) $(CFLAGS) -shared -o $(SO) $(SRC) -I$(REDIS_INCLUDE_PATH)
+	$(CC) $(CFLAGS) -shared -o $(SO) $(SRC) -I$(REDIS_INCLUDE_PATH) $(LIBS)
 
 # Clean up build artifacts
 clean:
