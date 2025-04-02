@@ -32,6 +32,7 @@
 
 // Default values
 #define DEFAULT_BROADCAST_ADDRESSES "255.255.255.255"
+#define DEFAULT_BROADCAST_NAME "imq-broker"
 #define DEFAULT_BROADCAST_PORT 63000
 #define DEFAULT_BROADCAST_INTERVAL 1
 #define MAX_REDIS_BINDS 8
@@ -55,6 +56,17 @@ void generate_redis_guid() {
     uuid_t binuuid;
     uuid_generate(binuuid);
     uuid_unparse_lower(binuuid, redis_guid);
+}
+
+
+char *get_broadcast_name() {
+    char *service_name = getenv("REDIS_BROADCAST_NAME");
+
+    if (!service_name) {
+        service_name = DEFAULT_BROADCAST_NAME;
+    }
+
+    return service_name;
 }
 
 void load_redis_bind_ips(RedisModuleCtx *ctx) {
@@ -147,7 +159,14 @@ int get_ip_for_broadcast(const char *broadcast_target, char *output_ip, const si
     }
 
     if (getifaddrs(&ifaddr) == -1) {
-        perror("getifaddrs failed");
+        RedisModule_Log(
+            NULL,
+            "error",
+            "%s: getifaddrs failed: %s",
+            get_broadcast_name(),
+            strerror(errno)
+        );
+
         return -1;
     }
 
@@ -199,7 +218,14 @@ void send_udp_broadcast(const int redis_port, char *broadcast_addresses, const i
     const int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
 
     if (sockfd < 0) {
-        perror("socket creation failed");
+        RedisModule_Log(
+            NULL,
+            "error",
+            "%s: socket creation failed: %s",
+            get_broadcast_name(),
+            strerror(errno)
+        );
+
         return;
     }
 
@@ -223,7 +249,13 @@ void send_udp_broadcast(const int redis_port, char *broadcast_addresses, const i
 
             if (getifaddrs(&ifaddr) == -1) {
                 freeifaddrs(ifaddr);
-                perror("imq-broker: getifaddrs failed in shutdown");
+                RedisModule_Log(
+                    NULL,
+                    "error",
+                    "%s: getifaddrs failed in shutdown: %s",
+                    get_broadcast_name(),
+                    strerror(errno)
+                );
 
                 return;
             }
@@ -247,7 +279,8 @@ void send_udp_broadcast(const int redis_port, char *broadcast_addresses, const i
                 snprintf(
                     message,
                     sizeof(message),
-                    "imq-broker\t%s\tup\t%s:%d\t%d",
+                    "%s\t%s\tup\t%s:%d\t%d",
+                    get_broadcast_name(),
                     redis_guid,
                     ip,
                     redis_port,
@@ -257,7 +290,13 @@ void send_udp_broadcast(const int redis_port, char *broadcast_addresses, const i
                 const int s = socket(AF_INET, SOCK_DGRAM, 0);
 
                 if (s < 0) {
-                    perror("imq-broker: socket failed for interface");
+                    RedisModule_Log(
+                        NULL,
+                        "warning",
+                        "%s: socket failed for interface: %s",
+                        get_broadcast_name(),
+                        strerror(errno)
+                    );
 
                     continue;
                 }
@@ -280,12 +319,20 @@ void send_udp_broadcast(const int redis_port, char *broadcast_addresses, const i
                     (struct sockaddr *)&dest,
                     sizeof(dest)
                 ) < 0) {
-                    perror("imq-broker: broadcast message failed");
+                    RedisModule_Log(
+                        NULL,
+                        "warning",
+                        "%s: broadcast to %s failed: %s",
+                        get_broadcast_name(),
+                        ip,
+                        strerror(errno)
+                    );
                 } else if (enable_logging) {
                     RedisModule_Log(
                         NULL,
                         "notice",
-                        "imq-broadcast: UDP Broadcast from %s: %s",
+                        "%s: UDP Broadcast from %s: %s",
+                        get_broadcast_name(),
                         ip,
                         message
                     );
@@ -296,10 +343,10 @@ void send_udp_broadcast(const int redis_port, char *broadcast_addresses, const i
 
             freeifaddrs(ifaddr);
         } else {
-            char interface_ip[INET_ADDRSTRLEN] = "UNKNOWN";
+            char ip[INET_ADDRSTRLEN] = "UNKNOWN";
 
-            if (get_ip_for_broadcast(token, interface_ip, sizeof(interface_ip)) != 0) {
-                fprintf(stderr, "imq-broker: no matching interface for %s\n", token);
+            if (get_ip_for_broadcast(token, ip, sizeof(ip)) != 0) {
+                fprintf(stderr, "%s: no matching interface for %s\n", get_broadcast_name(), token);
                 token = strtok(NULL, ",");
 
                 continue;
@@ -311,9 +358,10 @@ void send_udp_broadcast(const int redis_port, char *broadcast_addresses, const i
             snprintf(
                 message,
                 sizeof(message),
-                "imq-broker\t%s\tup\t%s:%d\t%d",
+                "%s\t%s\tup\t%s:%d\t%d",
+                get_broadcast_name(),
                 redis_guid,
-                interface_ip,
+                ip,
                 redis_port,
                 broadcast_interval
             );
@@ -331,12 +379,20 @@ void send_udp_broadcast(const int redis_port, char *broadcast_addresses, const i
                 (struct sockaddr *)&addr,
                 sizeof(addr)
             ) < 0) {
-                perror("imq-broker: broadcast message failed");
+                RedisModule_Log(
+                    NULL,
+                    "warning",
+                    "%s: broadcast to %s failed: %s",
+                    get_broadcast_name(),
+                    ip,
+                    strerror(errno)
+                );
             } else if (enable_logging) {
                 RedisModule_Log(
                     NULL,
                     "notice",
-                    "imq-broker: UDP Broadcast Sent to %s: %s",
+                    "%s: UDP Broadcast Sent to %s: %s",
+                    get_broadcast_name(),
                     token,
                     message
                 );
@@ -396,7 +452,13 @@ void shutdown_callback(
 
             if (getifaddrs(&ifaddr) == -1) {
                 freeifaddrs(ifaddr);
-                perror("imq-broker: getifaddrs failed in shutdown");
+                RedisModule_Log(
+                    ctx,
+                    "warning",
+                    "%s: getifaddrs failed in shutdown: %s",
+                    get_broadcast_name(),
+                    strerror(errno)
+                );
 
                 return;
             }
@@ -420,7 +482,8 @@ void shutdown_callback(
                 snprintf(
                     message,
                     sizeof(message),
-                    "imq-broker\t%s\tdown\t%s:%d",
+                    "%s\t%s\tdown\t%s:%d",
+                    get_broadcast_name(),
                     redis_guid,
                     ip,
                     global_redis_port
@@ -433,6 +496,7 @@ void shutdown_callback(
                 }
 
                 int broadcast = 1;
+
                 setsockopt(s, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
 
                 struct sockaddr_in dest = {0};
@@ -445,13 +509,18 @@ void shutdown_callback(
                 close(s);
 
                 if (ctx && enable_logging) {
-                    RedisModule_Log(ctx, "notice", "Shutdown broadcast from %s to 255.255.255.255", ip);
+                    RedisModule_Log(
+                        ctx,
+                        "notice",
+                        "%s: shutdown broadcast from %s to 255.255.255.255",
+                        get_broadcast_name(),
+                        ip
+                    );
                 }
             }
 
             freeifaddrs(ifaddr);
         } else {
-            // 🔁 Match specific subnet interface
             char ip[INET_ADDRSTRLEN] = "UNKNOWN";
 
             if (get_ip_for_broadcast(token, ip, sizeof(ip)) != 0) {
@@ -464,13 +533,14 @@ void shutdown_callback(
             snprintf(
                 message,
                 sizeof(message),
-                "imq-broker\t%s\tdown\t%s:%d",
+                "%s\t%s\tdown\t%s:%d",
+                get_broadcast_name(),
                 redis_guid,
                 ip,
                 global_redis_port
             );
 
-            int s = socket(AF_INET, SOCK_DGRAM, 0);
+            const int s = socket(AF_INET, SOCK_DGRAM, 0);
 
             if (s < 0) {
                 continue;
@@ -490,7 +560,14 @@ void shutdown_callback(
             close(s);
 
             if (ctx && enable_logging) {
-                RedisModule_Log(ctx, "notice", "Shutdown broadcast to %s from %s", token, ip);
+                RedisModule_Log(
+                    ctx,
+                    "notice",
+                    "%s: shutdown broadcast to %s from %s",
+                    get_broadcast_name(),
+                    token,
+                    ip
+                );
             }
         }
 
@@ -507,15 +584,6 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx) {
     }
 
     load_redis_bind_ips(ctx);
-
-    printf("bound ips: ");
-
-    for (int i = 0; i < MAX_REDIS_BINDS; i++) {
-        printf("%s", redis_bind_ips[i]);
-    }
-
-    printf("\n");
-
     RedisModule_SubscribeToServerEvent(ctx, RedisModuleEvent_Shutdown, shutdown_callback);
 
     RedisModuleCallReply *reply = RedisModule_Call(ctx, "CONFIG", "cc", "GET", "port");
