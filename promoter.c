@@ -26,6 +26,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <ifaddrs.h>
+#include <limits.h>
 #include "redismodule.h"
 
 // Default values
@@ -43,10 +44,27 @@ static int enable_logging = 0;
 static int global_redis_port = 6379;
 static char global_redis_host[INET_ADDRSTRLEN] = {0};
 
+int parse_int(const char *buff) {
+    char *end;
+
+    errno = 0;
+
+    const long sl = strtol(buff, &end, 10);
+
+    if (end == buff || '\0' != *end
+        || ((LONG_MIN == sl || LONG_MAX == sl) && ERANGE == errno)
+        || sl > INT_MAX
+        || sl < INT_MIN
+    ) {
+        return 0;
+    }
+
+    return (int)sl;
+}
+
 // Function to get local IP address
 void get_local_ip(char *buffer, size_t buffer_size) {
-    struct ifaddrs *ifaddr, *ifa;
-    int family;
+    struct ifaddrs *ifaddr;
 
     if (getifaddrs(&ifaddr) == -1) {
         perror("getifaddrs failed");
@@ -56,12 +74,12 @@ void get_local_ip(char *buffer, size_t buffer_size) {
         return;
     }
 
-    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+    for (const struct ifaddrs *ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
         if (ifa->ifa_addr == NULL) {
           continue;
         }
 
-        family = ifa->ifa_addr->sa_family;
+        const int family = ifa->ifa_addr->sa_family;
 
         if (family == AF_INET) {
             struct sockaddr_in *addr = (struct sockaddr_in *)ifa->ifa_addr;
@@ -78,7 +96,7 @@ int get_broadcast_port() {
     const char *env = getenv("REDIS_BROADCAST_PORT");
 
     if (env) {
-        int port = atoi(env);
+        int port = parse_int(env);
 
         if (port > 0 && port <= 65535) {
             return port;
@@ -91,7 +109,7 @@ int get_broadcast_port() {
 // Function to send UDP broadcast
 void send_udp_broadcast(int redis_port, char *broadcast_addresses) {
     char local_ip[INET_ADDRSTRLEN] = {0};
-    int broadcast_port = get_broadcast_port();
+    const int broadcast_port = get_broadcast_port();
 
     get_local_ip(local_ip, sizeof(local_ip));
 
@@ -99,11 +117,9 @@ void send_udp_broadcast(int redis_port, char *broadcast_addresses) {
 
     snprintf(message, sizeof(message), "imq-broker\tup\t%s:%d", local_ip, redis_port);
 
-    int sockfd;
     struct sockaddr_in broadcast_addr;
-    int broadcast_enable = 1;
-
-    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    const int broadcast_enable = 1;
+    const int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
 
     if (sockfd < 0) {
         perror("Socket creation failed");
@@ -111,7 +127,13 @@ void send_udp_broadcast(int redis_port, char *broadcast_addresses) {
         return;
     }
 
-    if (setsockopt(sockfd, SOL_SOCKET, SO_BROADCAST, &broadcast_enable, sizeof(broadcast_enable)) < 0) {
+    if (setsockopt(
+        sockfd,
+        SOL_SOCKET,
+        SO_BROADCAST,
+        &broadcast_enable,
+        sizeof(broadcast_enable)) < 0
+    ) {
         perror("Failed to set broadcast mode");
         close(sockfd);
 
@@ -126,7 +148,13 @@ void send_udp_broadcast(int redis_port, char *broadcast_addresses) {
         broadcast_addr.sin_addr.s_addr = inet_addr(token);
         broadcast_addr.sin_port = htons(broadcast_port);
 
-        if (sendto(sockfd, message, strlen(message), 0, (struct sockaddr *)&broadcast_addr, sizeof(broadcast_addr)) < 0) {
+        if (sendto(
+            sockfd,
+            message,
+            strlen(message),
+            0,
+            (struct sockaddr *)&broadcast_addr, sizeof(broadcast_addr)
+        ) < 0) {
             if (enable_logging) {
                 RedisModule_Log(NULL, "warning", "Broadcast to %s failed: %s", token, strerror(errno));
             }
@@ -142,6 +170,8 @@ void send_udp_broadcast(int redis_port, char *broadcast_addresses) {
     close(sockfd);
 }
 
+void *broadcast_thread(void *arg) __attribute__((noreturn));
+
 // Background thread function
 void *broadcast_thread(void *arg) {
     ThreadArgs *args = (ThreadArgs *)arg;
@@ -151,19 +181,16 @@ void *broadcast_thread(void *arg) {
     strcpy(broadcast_addresses, args->broadcast_addresses);
 
     // Get interval from environment variable
-    char *interval_str = getenv("REDIS_BROADCAST_INTERVAL");
-    int broadcast_interval = interval_str ? atoi(interval_str) : DEFAULT_BROADCAST_INTERVAL;
+    const char *interval_str = getenv("REDIS_BROADCAST_INTERVAL");
+    const int broadcast_interval = interval_str ? parse_int(interval_str) : DEFAULT_BROADCAST_INTERVAL;
 
     while (1) {
         sleep(broadcast_interval);
         send_udp_broadcast(redis_port, broadcast_addresses);
     }
-
-    free(args); // Free allocated memory
-
-    return NULL;
 }
 
+// ReSharper disable once CppParameterMayBeConstPtrOrRef, CppParameterMayBeConst
 void shutdown_callback(RedisModuleCtx *ctx, RedisModuleEvent e, uint64_t subevent, void *data) {
     (void)e;
     (void)subevent;
@@ -180,18 +207,18 @@ void shutdown_callback(RedisModuleCtx *ctx, RedisModuleEvent e, uint64_t subeven
     }
 
     char addresses[256];
-    int broadcast_port = get_broadcast_port();
+    const int broadcast_port = get_broadcast_port();
 
     strncpy(addresses, broadcast_addresses, sizeof(addresses));
     addresses[sizeof(addresses) - 1] = '\0';  // Ensure null-termination
 
-    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    const int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
 
     if (sockfd < 0) {
         return;
     }
 
-    int broadcast_enable = 1;
+    const int broadcast_enable = 1;
     setsockopt(sockfd, SOL_SOCKET, SO_BROADCAST, &broadcast_enable, sizeof(broadcast_enable));
 
     struct sockaddr_in addr;
@@ -258,7 +285,7 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx) {
             RedisModuleString *port_str = RedisModule_CreateStringFromCallReply(port_reply);
             size_t len;
             const char *port_cstr = RedisModule_StringPtrLen(port_str, &len);
-            global_redis_port = atoi(port_cstr);
+            global_redis_port = parse_int(port_cstr);
 
             RedisModule_FreeString(ctx, port_str);
         }
