@@ -37,12 +37,6 @@
 #define DEFAULT_BROADCAST_INTERVAL 1
 #define MAX_REDIS_BINDS 8
 
-// Struct to pass data to thread safely
-typedef struct {
-    int redis_port;
-    char broadcast_addresses[256];
-} ThreadArgs;
-
 static int enable_logging = 0;
 static int global_redis_port = 6379;
 
@@ -149,20 +143,32 @@ int parse_int(const char *buff) {
     return (int)sl;
 }
 
+uint32_t infer_mask(const char *broadcast_str) {
+    struct in_addr broadcast_addr;
+
+    if (inet_aton(broadcast_str, &broadcast_addr) == 0) {
+        return 0;
+    }
+
+    const uint32_t ip = ntohl(broadcast_addr.s_addr);
+
+    if ((ip & 0x0000FFFF) == 0x0000FFFF) return 0xFFFF0000;  // /16
+    if ((ip & 0x000000FF) == 0x000000FF) return 0xFFFFFF00;  // /24
+    if ((ip & 0x00FFFFFF) == 0x00FFFFFF) return 0xFF000000;  // /8
+
+    return 0;  // fallback: no match
+}
+
 // Function to get local IP address
 int get_ip_for_broadcast(const char *broadcast_target, char *output_ip, const size_t output_size) {
     struct ifaddrs *ifaddr;
-    struct in_addr target;
+    struct in_addr broadcast_addr;
 
-    if (inet_aton(broadcast_target, &target) == 0) {
-        return -1;  // Invalid broadcast IP
-    }
-
-    if (getifaddrs(&ifaddr) == -1) {
+    if (inet_aton(broadcast_target, &broadcast_addr) == 0) {
         RedisModule_Log(
             NULL,
             "error",
-            "%s: getifaddrs failed: %s",
+            "%s: invalid broadcast target given: %s",
             get_broadcast_name(),
             strerror(errno)
         );
@@ -170,26 +176,30 @@ int get_ip_for_broadcast(const char *broadcast_target, char *output_ip, const si
         return -1;
     }
 
-    for (struct ifaddrs *ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+    const uint32_t broadcast_ip = ntohl(broadcast_addr.s_addr);
+    const uint32_t inferred_mask = infer_mask(broadcast_target);
+
+    if (inferred_mask == 0) {
+        return -1;
+    }
+
+    if (getifaddrs(&ifaddr) == -1) {
+        return -1;
+    }
+
+    for (const struct ifaddrs *ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
         if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) {
             continue;
         }
 
         const struct sockaddr_in *addr = (struct sockaddr_in *)ifa->ifa_addr;
-        const struct sockaddr_in *netmask = (struct sockaddr_in *)ifa->ifa_netmask;
+        const uint32_t iface_ip = ntohl(addr->sin_addr.s_addr);
+        const uint32_t iface_broadcast = iface_ip | ~inferred_mask;
 
-        if (!netmask) {
-            continue;
-        }
-
-        struct in_addr subnet;
-        subnet.s_addr = addr->sin_addr.s_addr & netmask->sin_addr.s_addr;
-        struct in_addr broadcast;
-        broadcast.s_addr = subnet.s_addr | ~netmask->sin_addr.s_addr;
-
-        if (broadcast.s_addr == target.s_addr) {
+        if (iface_broadcast == broadcast_ip) {
             inet_ntop(AF_INET, &addr->sin_addr, output_ip, output_size);
             freeifaddrs(ifaddr);
+
             return 0;
         }
     }
@@ -203,7 +213,7 @@ int get_broadcast_port() {
     const char *env = getenv("REDIS_BROADCAST_PORT");
 
     if (env) {
-        int port = parse_int(env);
+        const int port = parse_int(env);
 
         if (port > 0 && port <= 65535) {
             return port;
@@ -213,15 +223,183 @@ int get_broadcast_port() {
     return DEFAULT_BROADCAST_PORT;  // Default port
 }
 
-// Function to send UDP broadcast
-void send_udp_broadcast(const int redis_port, char *broadcast_addresses, const int broadcast_interval) {
-    const int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+int get_broadcast_interval() {
+    const char *env = getenv("REDIS_BROADCAST_INTERVAL");
 
-    if (sockfd < 0) {
+    if (env) {
+        const int interval = parse_int(env);
+
+        if (interval > 0) {
+            return interval;
+        }
+    }
+
+    return DEFAULT_BROADCAST_INTERVAL;  // Default interval
+}
+
+int is_closing = 0;
+
+typedef struct {
+    char source_ip[INET_ADDRSTRLEN];
+    int redis_port;
+} BroadcastTask;
+
+// ReSharper disable once CppDFAConstantFunctionResult
+void *broadcast_thread_socket(void *arg) {
+    BroadcastTask *task = (BroadcastTask *)arg;
+    const char *broadcast_name = get_broadcast_name();
+    const int broadcast_port = get_broadcast_port();
+    const int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    const int broadcast = 1;
+    const int broadcast_interval = get_broadcast_interval();
+    struct sockaddr_in bind_addr = {0};
+
+    if (sock < 0) {
         RedisModule_Log(
             NULL,
             "error",
-            "%s: socket creation failed: %s",
+            "%s: socket failed: %s",
+            broadcast_name,
+            strerror(errno)
+        );
+
+        free(task);
+
+        return NULL;
+    }
+
+    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
+
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_addr.s_addr = inet_addr(task->source_ip);
+    bind_addr.sin_port = 0; // let OS choose a port
+
+    if (bind(sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+        RedisModule_Log(
+            NULL,
+            "error",
+            "%s: socket bind failed: %s",
+            broadcast_name,
+            strerror(errno)
+        );
+        close(sock);
+        free(task);
+
+        return NULL;
+    }
+
+    struct sockaddr_in dest = {0};
+
+    dest.sin_family = AF_INET;
+    dest.sin_addr.s_addr = inet_addr("255.255.255.255");
+    dest.sin_port = htons(broadcast_port);
+
+    while (1) {
+        char message[256];
+
+        if (is_closing) {
+            snprintf(
+                message,
+                sizeof(message),
+                "%s\t%s\tdown\t%s:%d",
+                broadcast_name,
+                redis_guid,
+                task->source_ip,
+                broadcast_interval
+            );
+        } else {
+            snprintf(
+                message,
+                sizeof(message),
+                "%s\t%s\tup\t%s:%d\t%d",
+                broadcast_name,
+                redis_guid,
+                task->source_ip,
+                task->redis_port,
+                broadcast_interval
+            );
+        }
+
+        if (sendto(
+            sock,
+            message,
+            strlen(message),
+            0,
+            (struct sockaddr *)&dest,
+            sizeof(dest)
+        ) < 0) {
+            RedisModule_Log(
+                NULL,
+                "warning",
+                "%s: broadcast to %s failed: %s",
+                broadcast_name,
+                task->source_ip,
+                strerror(errno)
+            );
+        } else if (enable_logging) {
+            RedisModule_Log(
+                NULL,
+                "notice",
+                "%s: UDP Broadcast from %s: %s",
+                broadcast_name,
+                task->source_ip,
+                message
+            );
+        }
+
+        if (is_closing) {
+            break;
+        }
+
+        sleep(broadcast_interval);
+    }
+
+    close(sock);
+    free(task);
+
+    return NULL;
+}
+
+int count_usable_interfaces() {
+    struct ifaddrs *ifaddr;
+    int count = 0;
+
+    if (getifaddrs(&ifaddr) == -1) {
+        return 0;
+    }
+
+    for (const struct ifaddrs *ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) {
+            continue;
+        }
+
+        ++count;
+    }
+
+    freeifaddrs(ifaddr);
+
+    return count;
+}
+
+void send_udp_broadcast_message(const int redis_port) {
+    struct ifaddrs *ifaddr;
+    const int max_threads = count_usable_interfaces();
+
+    if (!max_threads) {
+        RedisModule_Log(
+            NULL,
+            "notice",
+            "%s: no network interfaces found",
+            get_broadcast_name()
+        );
+    }
+
+    if (getifaddrs(&ifaddr) == -1) {
+        freeifaddrs(ifaddr);
+        RedisModule_Log(
+            NULL,
+            "error",
+            "%s: getifaddrs failed in shutdown: %s",
             get_broadcast_name(),
             strerror(errno)
         );
@@ -229,201 +407,37 @@ void send_udp_broadcast(const int redis_port, char *broadcast_addresses, const i
         return;
     }
 
-    const int broadcast_enable = 1;
-
-    setsockopt(
-        sockfd,
-        SOL_SOCKET,
-        SO_BROADCAST,
-        &broadcast_enable,
-        sizeof(broadcast_enable)
-    );
-
-    struct sockaddr_in addr;
-    char *token = strtok(broadcast_addresses, ",");
-
-    while (token) {
-        if (strcmp(token, "255.255.255.255") == 0) {
-            // Special handling: broadcast once per interface
-            struct ifaddrs *ifaddr;
-
-            if (getifaddrs(&ifaddr) == -1) {
-                freeifaddrs(ifaddr);
-                RedisModule_Log(
-                    NULL,
-                    "error",
-                    "%s: getifaddrs failed in shutdown: %s",
-                    get_broadcast_name(),
-                    strerror(errno)
-                );
-
-                return;
-            }
-
-            for (const struct ifaddrs *ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
-                if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) {
-                    continue;
-                }
-
-                const struct sockaddr_in *addr_in = (struct sockaddr_in *)ifa->ifa_addr;
-                char ip[INET_ADDRSTRLEN];
-
-                inet_ntop(AF_INET, &addr_in->sin_addr, ip, sizeof(ip));
-
-                if (!should_broadcast_from_ip(ip)) {
-                    continue;
-                }
-
-                char message[256];
-
-                snprintf(
-                    message,
-                    sizeof(message),
-                    "%s\t%s\tup\t%s:%d\t%d",
-                    get_broadcast_name(),
-                    redis_guid,
-                    ip,
-                    redis_port,
-                    broadcast_interval
-                );
-
-                const int s = socket(AF_INET, SOCK_DGRAM, 0);
-
-                if (s < 0) {
-                    RedisModule_Log(
-                        NULL,
-                        "warning",
-                        "%s: socket failed for interface: %s",
-                        get_broadcast_name(),
-                        strerror(errno)
-                    );
-
-                    continue;
-                }
-
-                int enable = 1;
-
-                setsockopt(s, SOL_SOCKET, SO_BROADCAST, &enable, sizeof(enable));
-
-                struct sockaddr_in dest = {0};
-
-                dest.sin_family = AF_INET;
-                dest.sin_addr.s_addr = inet_addr("255.255.255.255");
-                dest.sin_port = htons(DEFAULT_BROADCAST_PORT);
-
-                if (sendto(
-                    s,
-                    message,
-                    strlen(message),
-                    0,
-                    (struct sockaddr *)&dest,
-                    sizeof(dest)
-                ) < 0) {
-                    RedisModule_Log(
-                        NULL,
-                        "warning",
-                        "%s: broadcast to %s failed: %s",
-                        get_broadcast_name(),
-                        ip,
-                        strerror(errno)
-                    );
-                } else if (enable_logging) {
-                    RedisModule_Log(
-                        NULL,
-                        "notice",
-                        "%s: UDP Broadcast from %s: %s",
-                        get_broadcast_name(),
-                        ip,
-                        message
-                    );
-                }
-
-                close(s);
-            }
-
-            freeifaddrs(ifaddr);
-        } else {
-            char ip[INET_ADDRSTRLEN] = "UNKNOWN";
-
-            if (get_ip_for_broadcast(token, ip, sizeof(ip)) != 0) {
-                fprintf(stderr, "%s: no matching interface for %s\n", get_broadcast_name(), token);
-                token = strtok(NULL, ",");
-
-                continue;
-            }
-
-            // Compose the message with the correct interface IP
-            char message[256];
-
-            snprintf(
-                message,
-                sizeof(message),
-                "%s\t%s\tup\t%s:%d\t%d",
-                get_broadcast_name(),
-                redis_guid,
-                ip,
-                redis_port,
-                broadcast_interval
-            );
-
-            memset(&addr, 0, sizeof(addr));
-            addr.sin_family = AF_INET;
-            addr.sin_addr.s_addr = inet_addr(token);
-            addr.sin_port = htons(DEFAULT_BROADCAST_PORT);
-
-            if (sendto(
-                sockfd,
-                message,
-                strlen(message),
-                0,
-                (struct sockaddr *)&addr,
-                sizeof(addr)
-            ) < 0) {
-                RedisModule_Log(
-                    NULL,
-                    "warning",
-                    "%s: broadcast to %s failed: %s",
-                    get_broadcast_name(),
-                    ip,
-                    strerror(errno)
-                );
-            } else if (enable_logging) {
-                RedisModule_Log(
-                    NULL,
-                    "notice",
-                    "%s: UDP Broadcast Sent to %s: %s",
-                    get_broadcast_name(),
-                    token,
-                    message
-                );
-            }
+    for (const struct ifaddrs *ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) {
+            continue;
         }
 
-        token = strtok(NULL, ",");
-        close(sockfd);
+        const struct sockaddr_in *addr_in = (struct sockaddr_in *)ifa->ifa_addr;
+        char ip[INET_ADDRSTRLEN];
+
+        inet_ntop(AF_INET, &addr_in->sin_addr, ip, sizeof(ip));
+
+        if (!should_broadcast_from_ip(ip)) {
+            continue;
+        }
+
+        // memory is freed inside the thread
+        // ReSharper disable once CppDFAMemoryLeak
+        BroadcastTask *task = malloc(sizeof(BroadcastTask));
+
+        strncpy(task->source_ip, ip, sizeof(task->source_ip));
+        task->redis_port = redis_port;
+
+        pthread_t tid;
+        pthread_create(&tid, NULL, broadcast_thread_socket, task);
+        pthread_detach(tid);
     }
-}
 
-// ReSharper disable once CppDFAConstantFunctionResult
-void *broadcast_thread(void *arg) {
-    const ThreadArgs *args = (ThreadArgs *)arg;
-    const int redis_port = args->redis_port;
-    char broadcast_addresses[256];
-
-    strcpy(broadcast_addresses, args->broadcast_addresses);
-
-    // Get interval from environment variable
-    const char *interval_str = getenv("REDIS_BROADCAST_INTERVAL");
-    const int broadcast_interval = interval_str ? parse_int(interval_str) : DEFAULT_BROADCAST_INTERVAL;
-
-    // ReSharper disable once CppDFAEndlessLoop
-    while (1) {
-        send_udp_broadcast(redis_port, broadcast_addresses, broadcast_interval);
-        sleep(broadcast_interval);
-    }
+    freeifaddrs(ifaddr);
 }
 
 void shutdown_callback(
+    // ReSharper disable once CppParameterMayBeConstPtrOrRef
     RedisModuleCtx *ctx,
     // ReSharper disable once CppParameterMayBeConst
     RedisModuleEvent e,
@@ -432,147 +446,13 @@ void shutdown_callback(
     // ReSharper disable once CppParameterMayBeConstPtrOrRef
     void *data
 ) {
+    (void)ctx;
     (void)e;
     (void)subevent;
     (void)data;
 
-    const char *broadcast_addresses_env = getenv("REDIS_BROADCAST_ADDRESSES");
-    const char *fallback = "255.255.255.255";
-    const char *addresses_raw = broadcast_addresses_env ? broadcast_addresses_env : fallback;
-    char addresses[256];
-
-    strncpy(addresses, addresses_raw, sizeof(addresses));
-    addresses[sizeof(addresses) - 1] = '\0';
-
-    char *token = strtok(addresses, ",");
-
-    while (token) {
-        if (strcmp(token, "255.255.255.255") == 0) {
-            struct ifaddrs *ifaddr;
-
-            if (getifaddrs(&ifaddr) == -1) {
-                freeifaddrs(ifaddr);
-                RedisModule_Log(
-                    ctx,
-                    "warning",
-                    "%s: getifaddrs failed in shutdown: %s",
-                    get_broadcast_name(),
-                    strerror(errno)
-                );
-
-                return;
-            }
-
-            for (const struct ifaddrs *ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
-                if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) {
-                    continue;
-                }
-
-                struct sockaddr_in *addr_in = (struct sockaddr_in *)ifa->ifa_addr;
-                char ip[INET_ADDRSTRLEN];
-
-                inet_ntop(AF_INET, &addr_in->sin_addr, ip, sizeof(ip));
-
-                if (!should_broadcast_from_ip(ip)) {
-                    continue;
-                }
-
-                char message[256];
-
-                snprintf(
-                    message,
-                    sizeof(message),
-                    "%s\t%s\tdown\t%s:%d",
-                    get_broadcast_name(),
-                    redis_guid,
-                    ip,
-                    global_redis_port
-                );
-
-                const int s = socket(AF_INET, SOCK_DGRAM, 0);
-
-                if (s < 0) {
-                    continue;
-                }
-
-                int broadcast = 1;
-
-                setsockopt(s, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
-
-                struct sockaddr_in dest = {0};
-
-                dest.sin_family = AF_INET;
-                dest.sin_addr.s_addr = inet_addr("255.255.255.255");
-                dest.sin_port = htons(DEFAULT_BROADCAST_PORT);
-
-                sendto(s, message, strlen(message), 0, (struct sockaddr *)&dest, sizeof(dest));
-                close(s);
-
-                if (ctx && enable_logging) {
-                    RedisModule_Log(
-                        ctx,
-                        "notice",
-                        "%s: shutdown broadcast from %s to 255.255.255.255",
-                        get_broadcast_name(),
-                        ip
-                    );
-                }
-            }
-
-            freeifaddrs(ifaddr);
-        } else {
-            char ip[INET_ADDRSTRLEN] = "UNKNOWN";
-
-            if (get_ip_for_broadcast(token, ip, sizeof(ip)) != 0) {
-                token = strtok(NULL, ",");
-                continue;
-            }
-
-            char message[256];
-
-            snprintf(
-                message,
-                sizeof(message),
-                "%s\t%s\tdown\t%s:%d",
-                get_broadcast_name(),
-                redis_guid,
-                ip,
-                global_redis_port
-            );
-
-            const int s = socket(AF_INET, SOCK_DGRAM, 0);
-
-            if (s < 0) {
-                continue;
-            }
-
-            int broadcast = 1;
-
-            setsockopt(s, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
-
-            struct sockaddr_in dest = {0};
-
-            dest.sin_family = AF_INET;
-            dest.sin_addr.s_addr = inet_addr(token);
-            dest.sin_port = htons(DEFAULT_BROADCAST_PORT);
-
-            sendto(s, message, strlen(message), 0, (struct sockaddr *)&dest, sizeof(dest));
-            close(s);
-
-            if (ctx && enable_logging) {
-                RedisModule_Log(
-                    ctx,
-                    "notice",
-                    "%s: shutdown broadcast to %s from %s",
-                    get_broadcast_name(),
-                    token,
-                    ip
-                );
-            }
-        }
-
-        token = strtok(NULL, ",");
-    }
+    is_closing = 1;
+    sleep(1);
 }
 
 // Redis Module initialization
@@ -583,6 +463,7 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx) {
         return REDISMODULE_ERR;
     }
 
+    is_closing = 0;
     load_redis_bind_ips(ctx);
     RedisModule_SubscribeToServerEvent(ctx, RedisModuleEvent_Shutdown, shutdown_callback);
 
@@ -632,28 +513,7 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx) {
         RedisModule_FreeCallReply(reply);
     }
 
-    // Get broadcast addresses
-    char *broadcast_addresses = getenv("REDIS_BROADCAST_ADDRESSES");
-
-    if (!broadcast_addresses) {
-        broadcast_addresses = DEFAULT_BROADCAST_ADDRESSES;
-    }
-
-    // Allocate memory for thread arguments
-    ThreadArgs *args = malloc(sizeof(ThreadArgs));
-    args->redis_port = global_redis_port;
-    strncpy(args->broadcast_addresses, broadcast_addresses, sizeof(args->broadcast_addresses));
-
-    // Start background thread
-    pthread_t thread_id;
-
-    if (pthread_create(&thread_id, NULL, broadcast_thread, args) != 0) {
-        free(args);  // Free memory if thread fails
-
-        return REDISMODULE_ERR;
-    }
-
-    pthread_detach(thread_id);
+    send_udp_broadcast_message(global_redis_port);
 
     return REDISMODULE_OK;
 }
