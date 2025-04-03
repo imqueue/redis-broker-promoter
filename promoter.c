@@ -291,7 +291,7 @@ void *broadcast_thread_socket(void *arg) {
     struct sockaddr_in dest = {0};
 
     dest.sin_family = AF_INET;
-    dest.sin_addr.s_addr = inet_addr("255.255.255.255");
+    dest.sin_addr.s_addr = inet_addr(DEFAULT_BROADCAST_ADDRESSES);
     dest.sin_port = htons(broadcast_port);
 
     while (1) {

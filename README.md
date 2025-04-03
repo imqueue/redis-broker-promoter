@@ -22,7 +22,6 @@ See all available targets in Makefile (install/uninstall/reload/run etc.).
 
 Environment variables available:
 
- - REDIS_BROADCAST_ADDRESSES (default is "255.255.255.255")
  - REDIS_BROADCAST_NAME (default is "imq-broker")
  - REDIS_BROADCAST_PORT (default is 63000)
  - REDIS_BROADCAST_INTERVAL (in seconds, default is 1 second)
