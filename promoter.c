@@ -117,7 +117,7 @@ int should_broadcast_from_ip(const char *ip) {
     }
 
     for (int i = 0; i < redis_bind_count; i++) {
-        if (strcmp(ip, redis_bind_ips[i]) == 0) {
+        if (strcmp(redis_bind_ips[i], "*") == 0 || strcmp(ip, redis_bind_ips[i]) == 0) {
             return 1;
         }
     }
@@ -132,7 +132,8 @@ int parse_int(const char *buff) {
 
     const long sl = strtol(buff, &end, 10);
 
-    if (end == buff || '\0' != *end
+    if (end == buff
+        || '\0' != *end
         || ((LONG_MIN == sl || LONG_MAX == sl) && ERANGE == errno)
         || sl > INT_MAX
         || sl < INT_MIN
@@ -152,9 +153,9 @@ uint32_t infer_mask(const char *broadcast_str) {
 
     const uint32_t ip = ntohl(broadcast_addr.s_addr);
 
+    if ((ip & 0x00FFFFFF) == 0x00FFFFFF) return 0xFF000000;  // /8
     if ((ip & 0x0000FFFF) == 0x0000FFFF) return 0xFFFF0000;  // /16
     if ((ip & 0x000000FF) == 0x000000FF) return 0xFFFFFF00;  // /24
-    if ((ip & 0x00FFFFFF) == 0x00FFFFFF) return 0xFF000000;  // /8
 
     return 0;  // fallback: no match
 }
@@ -305,7 +306,7 @@ void *broadcast_thread_socket(void *arg) {
                 broadcast_name,
                 redis_guid,
                 task->source_ip,
-                broadcast_interval
+                task->redis_port
             );
         } else {
             snprintf(
@@ -471,12 +472,15 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx) {
     // Determine if we should enable logging based on Redis loglevel
     RedisModuleCallReply *loglevel_reply = RedisModule_Call(ctx, "CONFIG", "cc", "GET", "loglevel");
 
-    if (loglevel_reply && RedisModule_CallReplyType(loglevel_reply) == REDISMODULE_REPLY_ARRAY &&
+    if (loglevel_reply &&
+        RedisModule_CallReplyType(loglevel_reply) == REDISMODULE_REPLY_ARRAY &&
         RedisModule_CallReplyLength(loglevel_reply) == 2
     ) {
         RedisModuleCallReply *level = RedisModule_CallReplyArrayElement(loglevel_reply, 1);
 
-        if (level && RedisModule_CallReplyType(level) == REDISMODULE_REPLY_STRING) {
+        if (level &&
+            RedisModule_CallReplyType(level) == REDISMODULE_REPLY_STRING
+        ) {
             RedisModuleString *level_str = RedisModule_CreateStringFromCallReply(level);
             size_t len;
             const char *level_cstr = RedisModule_StringPtrLen(level_str, &len);
@@ -493,12 +497,15 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx) {
         RedisModule_FreeCallReply(loglevel_reply);
     }
 
-    if (reply && RedisModule_CallReplyType(reply) == REDISMODULE_REPLY_ARRAY &&
+    if (reply &&
+        RedisModule_CallReplyType(reply) == REDISMODULE_REPLY_ARRAY &&
         RedisModule_CallReplyLength(reply) == 2
     ) {
         RedisModuleCallReply *port_reply = RedisModule_CallReplyArrayElement(reply, 1);
 
-        if (port_reply && RedisModule_CallReplyType(port_reply) == REDISMODULE_REPLY_STRING) {
+        if (port_reply &&
+            RedisModule_CallReplyType(port_reply) == REDISMODULE_REPLY_STRING
+        ) {
             RedisModuleString *port_str = RedisModule_CreateStringFromCallReply(port_reply);
             size_t len;
             const char *port_cstr = RedisModule_StringPtrLen(port_str, &len);
