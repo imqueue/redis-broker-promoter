@@ -17,6 +17,7 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -39,6 +40,7 @@
 
 static int enable_logging = 0;
 static int global_redis_port = 6379;
+static int global_redis_tls = 0;
 
 static char redis_guid[37];
 
@@ -238,11 +240,161 @@ int get_broadcast_interval() {
     return DEFAULT_BROADCAST_INTERVAL;  // Default interval
 }
 
+/*
+ * Reads one integer directive out of the running configuration.
+ *
+ * Returns `fallback` when the directive is not there at all: `tls-port` does
+ * not exist on a Redis built without TLS, and CONFIG GET answers that with an
+ * empty array rather than with an error.
+ */
+int get_config_int(RedisModuleCtx *ctx, const char *name, const int fallback) {
+    int value = fallback;
+    RedisModuleCallReply *reply = RedisModule_Call(ctx, "CONFIG", "cc", "GET", name);
+
+    if (reply
+        && RedisModule_CallReplyType(reply) == REDISMODULE_REPLY_ARRAY
+        && RedisModule_CallReplyLength(reply) == 2
+    ) {
+        RedisModuleCallReply *value_reply = RedisModule_CallReplyArrayElement(reply, 1);
+
+        if (value_reply
+            && RedisModule_CallReplyType(value_reply) == REDISMODULE_REPLY_STRING
+        ) {
+            RedisModuleString *value_str = RedisModule_CreateStringFromCallReply(value_reply);
+            size_t len;
+            const char *value_cstr = RedisModule_StringPtrLen(value_str, &len);
+
+            value = parse_int(value_cstr);
+
+            RedisModule_FreeString(ctx, value_str);
+        }
+    }
+
+    if (reply) {
+        RedisModule_FreeCallReply(reply);
+    }
+
+    return value;
+}
+
+/*
+ * REDIS_BROADCAST_TLS: 1 announces the TLS listener, 0 announces the plaintext
+ * one, -1 (unset, or anything unrecognised) announces whichever is up.
+ */
+int get_tls_preference() {
+    const char *env = getenv("REDIS_BROADCAST_TLS");
+
+    if (!env || !*env) {
+        return -1;
+    }
+
+    if (!strcasecmp(env, "1") || !strcasecmp(env, "yes")
+        || !strcasecmp(env, "true") || !strcasecmp(env, "on")
+    ) {
+        return 1;
+    }
+
+    if (!strcasecmp(env, "0") || !strcasecmp(env, "no")
+        || !strcasecmp(env, "false") || !strcasecmp(env, "off")
+    ) {
+        return 0;
+    }
+
+    RedisModule_Log(
+        NULL,
+        "warning",
+        "%s: REDIS_BROADCAST_TLS='%s' is not one of 1/0, yes/no, true/false,"
+        " on/off - ignored, the listening port decides",
+        get_broadcast_name(),
+        env
+    );
+
+    return -1;
+}
+
+/*
+ * The port a client can actually reach this broker on, and whether reaching it
+ * means TLS.
+ *
+ * `port 0` does not mean "no port": it is how Redis is told to stop listening
+ * in plaintext, and a TLS-only broker is configured in exactly that way. This
+ * announcement has always carried `port` verbatim, so such a broker announced
+ * `<ip>:0` - an address nothing can connect to, and one that @imqueue's UDP
+ * listener drops as malformed. The fleet then saw no broker at all, and no
+ * error anywhere said why: the announcement did go out, it was just useless.
+ *
+ * So the announced port is the one that is listening. When BOTH are listening
+ * plaintext wins, because that is what every existing deployment already
+ * announces, and an image upgrade must not move a fleet onto a transport its
+ * clients are not configured for. REDIS_BROADCAST_TLS=1 is how that move is
+ * made deliberately.
+ *
+ * @param ctx - module context, used to read the configuration
+ * @param is_tls - set to 1 when the returned port is the TLS listener
+ * @returns the port to announce, or 0 when there is nothing worth announcing
+ */
+int resolve_announced_port(RedisModuleCtx *ctx, int *is_tls) {
+    const int port = get_config_int(ctx, "port", 0);
+    const int tls_port = get_config_int(ctx, "tls-port", 0);
+    const int prefer_tls = get_tls_preference();
+
+    *is_tls = 0;
+
+    if (prefer_tls == 1) {
+        if (tls_port > 0) {
+            *is_tls = 1;
+
+            return tls_port;
+        }
+
+        // announcing the plaintext port instead would silently undo an explicit
+        // request for TLS, which is the one outcome worse than not being found
+        RedisModule_Log(
+            NULL,
+            "warning",
+            "%s: REDIS_BROADCAST_TLS asks for the TLS listener, but `tls-port`"
+            " is 0 or unsupported by this build",
+            get_broadcast_name()
+        );
+
+        return 0;
+    }
+
+    if (prefer_tls == 0) {
+        if (port > 0) {
+            return port;
+        }
+
+        RedisModule_Log(
+            NULL,
+            "warning",
+            "%s: REDIS_BROADCAST_TLS asks for the plaintext listener, but"
+            " `port` is 0",
+            get_broadcast_name()
+        );
+
+        return 0;
+    }
+
+    if (port > 0) {
+        return port;
+    }
+
+    if (tls_port > 0) {
+        *is_tls = 1;
+
+        return tls_port;
+    }
+
+    return 0;
+}
+
 int is_closing = 0;
 
 typedef struct {
     char source_ip[INET_ADDRSTRLEN];
     int redis_port;
+    int redis_tls;
 } BroadcastTask;
 
 // ReSharper disable once CppDFAConstantFunctionResult
@@ -309,15 +461,21 @@ void *broadcast_thread_socket(void *arg) {
                 task->redis_port
             );
         } else {
+            // the transport is the SIXTH field, after the interval, and only on
+            // `up`. A reader that splits on tabs and takes the first five gets
+            // exactly what it got before, and `down` keeps the four fields it
+            // has always had - where a fifth would land in the interval's slot
+            // and be read as a timeout of NaN, which drops the whole datagram.
             snprintf(
                 message,
                 sizeof(message),
-                "%s\t%s\tup\t%s:%d\t%d",
+                "%s\t%s\tup\t%s:%d\t%d\t%s",
                 broadcast_name,
                 redis_guid,
                 task->source_ip,
                 task->redis_port,
-                broadcast_interval
+                broadcast_interval,
+                task->redis_tls ? "tls" : "plain"
             );
         }
 
@@ -382,7 +540,7 @@ int count_usable_interfaces() {
     return count;
 }
 
-void send_udp_broadcast_message(const int redis_port) {
+void send_udp_broadcast_message(const int redis_port, const int redis_tls) {
     struct ifaddrs *ifaddr;
     const int max_threads = count_usable_interfaces();
 
@@ -428,6 +586,7 @@ void send_udp_broadcast_message(const int redis_port) {
 
         strncpy(task->source_ip, ip, sizeof(task->source_ip));
         task->redis_port = redis_port;
+        task->redis_tls = redis_tls;
 
         pthread_t tid;
         pthread_create(&tid, NULL, broadcast_thread_socket, task);
@@ -468,7 +627,6 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx) {
     load_redis_bind_ips(ctx);
     RedisModule_SubscribeToServerEvent(ctx, RedisModuleEvent_Shutdown, shutdown_callback);
 
-    RedisModuleCallReply *reply = RedisModule_Call(ctx, "CONFIG", "cc", "GET", "port");
     // Determine if we should enable logging based on Redis loglevel
     RedisModuleCallReply *loglevel_reply = RedisModule_Call(ctx, "CONFIG", "cc", "GET", "loglevel");
 
@@ -497,30 +655,32 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx) {
         RedisModule_FreeCallReply(loglevel_reply);
     }
 
-    if (reply &&
-        RedisModule_CallReplyType(reply) == REDISMODULE_REPLY_ARRAY &&
-        RedisModule_CallReplyLength(reply) == 2
-    ) {
-        RedisModuleCallReply *port_reply = RedisModule_CallReplyArrayElement(reply, 1);
+    global_redis_port = resolve_announced_port(ctx, &global_redis_tls);
 
-        if (port_reply &&
-            RedisModule_CallReplyType(port_reply) == REDISMODULE_REPLY_STRING
-        ) {
-            RedisModuleString *port_str = RedisModule_CreateStringFromCallReply(port_reply);
-            size_t len;
-            const char *port_cstr = RedisModule_StringPtrLen(port_str, &len);
+    if (global_redis_port <= 0) {
+        // a broker that announces nothing is invisible to the whole fleet, so
+        // this is a warning and it is the last word on the subject - the reason
+        // was logged by resolve_announced_port
+        RedisModule_Log(
+            ctx,
+            "warning",
+            "%s: no reachable listener to announce, this broker stays invisible",
+            get_broadcast_name()
+        );
 
-            global_redis_port = parse_int(port_cstr);
-
-            RedisModule_FreeString(ctx, port_str);
-        }
+        return REDISMODULE_OK;
     }
 
-    if (reply) {
-        RedisModule_FreeCallReply(reply);
-    }
+    RedisModule_Log(
+        ctx,
+        "notice",
+        "%s: announcing port %d (%s)",
+        get_broadcast_name(),
+        global_redis_port,
+        global_redis_tls ? "tls" : "plain"
+    );
 
-    send_udp_broadcast_message(global_redis_port);
+    send_udp_broadcast_message(global_redis_port, global_redis_tls);
 
     return REDISMODULE_OK;
 }
