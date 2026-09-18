@@ -647,6 +647,62 @@ void cleanup_threads() {
     thread_count = 0;
 }
 
+// set by the first cron tick after load, reset in RedisModule_OnLoad() so a
+// reloaded module announces again
+static int announced = 0;
+
+/*
+ * Starts the broadcaster threads.
+ *
+ * Called from the startup cron hook rather than from RedisModule_OnLoad(),
+ * because modules are loaded before the listeners exist: announcing there
+ * advertised an address that still refused connections, and a client that
+ * dialled the address it learned that way was refused.
+ */
+void start_broadcasting(RedisModuleCtx *ctx) {
+    RedisModule_Log(
+        ctx,
+        "notice",
+        "%s: announcing port %d (%s)",
+        get_broadcast_name(),
+        global_redis_port,
+        global_redis_tls ? "tls" : "plain"
+    );
+
+    send_udp_broadcast_message(global_redis_port, global_redis_tls);
+}
+
+/*
+ * Fires on every server cron; announces on the first one after load.
+ *
+ * Redis enters its event loop only after initListeners() and loadDataFromDisk(),
+ * so the first announcement cannot precede the listener.
+ *
+ * The hook stays subscribed for the life of the module. Unsubscribing from
+ * inside the callback frees the listener that moduleFireServerEvent() still
+ * dereferences after the callback returns (el->module->in_hook--), a
+ * use-after-free on every redis from 6.2 to unstable; redis drops the
+ * subscription itself on unload. A flag check per cron tick is the cost.
+ */
+void cron_broadcast_once(
+    RedisModuleCtx *ctx,
+    RedisModuleEvent e,
+    uint64_t subevent,
+    void *data
+) {
+    (void)e;
+    (void)subevent;
+    (void)data;
+
+    // a shutdown that wins the race must not start broadcaster threads
+    if (announced || is_closing) {
+        return;
+    }
+
+    announced = 1;
+    start_broadcasting(ctx);
+}
+
 void shutdown_callback(
     // ReSharper disable once CppParameterMayBeConstPtrOrRef
     RedisModuleCtx *ctx,
@@ -675,6 +731,9 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx) {
     }
 
     is_closing = 0;
+    // a reloaded module must announce again; on musl the DSO is never unloaded,
+    // so file-scope state survives MODULE UNLOAD / LOAD unless reset here
+    announced = 0;
     load_redis_bind_ips(ctx);
     RedisModule_SubscribeToServerEvent(ctx, RedisModuleEvent_Shutdown, shutdown_callback);
 
@@ -722,16 +781,17 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx) {
         return REDISMODULE_OK;
     }
 
-    RedisModule_Log(
-        ctx,
-        "notice",
-        "%s: announcing port %d (%s)",
-        get_broadcast_name(),
-        global_redis_port,
-        global_redis_tls ? "tls" : "plain"
-    );
-
-    send_udp_broadcast_message(global_redis_port, global_redis_tls);
+    if (RedisModule_SubscribeToServerEvent(
+            ctx, RedisModuleEvent_CronLoop, cron_broadcast_once) != REDISMODULE_OK) {
+        // without the hook nothing ever announces, which is the one failure
+        // this module must never keep quiet about
+        RedisModule_Log(
+            ctx,
+            "warning",
+            "%s: could not register the startup hook, this broker stays invisible",
+            get_broadcast_name()
+        );
+    }
 
     return REDISMODULE_OK;
 }
