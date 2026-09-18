@@ -48,6 +48,9 @@ static char redis_bind_ips[MAX_REDIS_BINDS][INET_ADDRSTRLEN];
 static int redis_bind_count = 0;
 static int allow_all_interfaces = 0;
 
+static pthread_t *thread_ids = NULL;
+static int thread_count = 0;
+
 void generate_redis_guid() {
     uuid_t binuuid;
     uuid_generate(binuuid);
@@ -551,14 +554,15 @@ void send_udp_broadcast_message(const int redis_port, const int redis_tls) {
             "%s: no network interfaces found",
             get_broadcast_name()
         );
+
+        return;
     }
 
     if (getifaddrs(&ifaddr) == -1) {
-        freeifaddrs(ifaddr);
         RedisModule_Log(
             NULL,
             "error",
-            "%s: getifaddrs failed in shutdown: %s",
+            "%s: getifaddrs failed: %s",
             get_broadcast_name(),
             strerror(errno)
         );
@@ -566,7 +570,24 @@ void send_udp_broadcast_message(const int redis_port, const int redis_tls) {
         return;
     }
 
-    for (const struct ifaddrs *ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+    thread_ids = malloc(sizeof(pthread_t) * max_threads);
+
+    if (!thread_ids) {
+        freeifaddrs(ifaddr);
+        RedisModule_Log(
+            NULL,
+            "error",
+            "%s: failed to allocate thread array",
+            get_broadcast_name()
+        );
+
+        return;
+    }
+
+    thread_count = 0;
+
+    // the interface list can grow between the count above and this scan
+    for (const struct ifaddrs *ifa = ifaddr; ifa && thread_count < max_threads; ifa = ifa->ifa_next) {
         if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) {
             continue;
         }
@@ -584,16 +605,46 @@ void send_udp_broadcast_message(const int redis_port, const int redis_tls) {
         // ReSharper disable once CppDFAMemoryLeak
         BroadcastTask *task = malloc(sizeof(BroadcastTask));
 
+        if (!task) {
+            continue;
+        }
+
         strncpy(task->source_ip, ip, sizeof(task->source_ip));
         task->redis_port = redis_port;
         task->redis_tls = redis_tls;
 
         pthread_t tid;
-        pthread_create(&tid, NULL, broadcast_thread_socket, task);
-        pthread_detach(tid);
+
+        // joinable on purpose: a detached thread outlives MODULE UNLOAD, and
+        // on glibc it then wakes up inside code that dlclose() has unmapped
+        if (pthread_create(&tid, NULL, broadcast_thread_socket, task) == 0) {
+            thread_ids[thread_count++] = tid;
+        } else {
+            free(task);
+        }
     }
 
     freeifaddrs(ifaddr);
+}
+
+/*
+ * Tells the broadcasters to say "down" and waits for every one of them, so that
+ * none is left running once redis unloads this module.
+ */
+void cleanup_threads() {
+    if (!thread_ids) {
+        return;
+    }
+
+    is_closing = 1;
+
+    for (int i = 0; i < thread_count; i++) {
+        pthread_join(thread_ids[i], NULL);
+    }
+
+    free(thread_ids);
+    thread_ids = NULL;
+    thread_count = 0;
 }
 
 void shutdown_callback(
@@ -681,6 +732,19 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx) {
     );
 
     send_udp_broadcast_message(global_redis_port, global_redis_tls);
+
+    return REDISMODULE_OK;
+}
+
+/*
+ * Redis calls this as int (*)(RedisModuleCtx *) and refuses the unload when it
+ * returns REDISMODULE_ERR. Without it the broadcasters kept running after the
+ * unload: a crash on glibc, a leaked announcer per reload on musl.
+ */
+int RedisModule_OnUnload(RedisModuleCtx *ctx) {
+    (void)ctx;
+
+    cleanup_threads();
 
     return REDISMODULE_OK;
 }
